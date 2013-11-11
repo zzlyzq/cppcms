@@ -4,13 +4,13 @@ set(CMAKE_LEGACY_CYGWIN_WIN32 0)
 
 project(cppcms)
 set(CPPCMS_PACKAGE_NAME "CppCMS")
-set(CPPCMS_PACKAGE_STRING "CppCMS/1.0.4")
-set(CPPCMS_PACKAGE_VERSION "1.0.4")
+set(CPPCMS_PACKAGE_STRING "CppCMS/1.1.0")
+set(CPPCMS_PACKAGE_VERSION "1.1.0")
 
-set(CPPCMS_VERSION "1.0.4")
+set(CPPCMS_VERSION "1.1.0")
 set(CPPCMS_SOVERSION "1")
 
-set(BOOSTER_VERSION "0.0.2")
+set(BOOSTER_VERSION "0.0.0")
 set(BOOSTER_SOVERSION "0")
 
 include(CheckFunctionExists)
@@ -362,13 +362,6 @@ set(CPPCMS_SOURCES
 	src/send_timeout.cpp
 )
 
-if(NOT DISABLE_GZIP)
-	set(CPPCMS_SOURCES ${CPPCMS_SOURCES}
-		cppcms_boost/src/zlib.cpp
-		cppcms_boost/src/gzip.cpp)
-endif()
-
-
 if(NOT DISABLE_TCPCACHE)
 	set(CPPCMS_SOURCES ${CPPCMS_SOURCES}
 		src/tcp_cache_client.cpp
@@ -549,6 +542,37 @@ add_custom_command(
 
 
 
+add_custom_command(
+	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_a.cpp ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_a.h
+	COMMAND ${PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/bin/cppcms_tmpl_cc 
+		-o ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_a.cpp -H ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_a.h
+			${CMAKE_CURRENT_SOURCE_DIR}/tests/tc_skin_a.tmpl
+	DEPENDS 
+		${CMAKE_CURRENT_SOURCE_DIR}/bin/cppcms_tmpl_cc 
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/tc_skin_a.tmpl)
+
+add_custom_command(
+	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_b.cpp ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_b.h
+	COMMAND ${PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/bin/cppcms_tmpl_cc 
+		-o ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_b.cpp -H ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin_b.h
+			${CMAKE_CURRENT_SOURCE_DIR}/tests/tc_skin_b.tmpl
+	DEPENDS 
+		${CMAKE_CURRENT_SOURCE_DIR}/bin/cppcms_tmpl_cc 
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/tc_skin_b.tmpl)
+
+add_custom_command(
+	OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin.cpp ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin.h
+	COMMAND ${PYTHON} ${CMAKE_CURRENT_SOURCE_DIR}/bin/cppcms_tmpl_cc 
+		-o ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin.cpp -H ${CMAKE_CURRENT_BINARY_DIR}/tc_sep_skin.h
+			${CMAKE_CURRENT_SOURCE_DIR}/tests/tc_skin.tmpl
+	DEPENDS 
+		${CMAKE_CURRENT_SOURCE_DIR}/bin/cppcms_tmpl_cc 
+		${CMAKE_CURRENT_SOURCE_DIR}/tests/tc_skin.tmpl)
+
+
+
+
+
 if(NOT DISABLE_SHARED)
 	add_custom_command(
 		OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/skin3.cpp
@@ -567,7 +591,7 @@ if(NOT DISABLE_SHARED)
 				COMPILE_DEFINITIONS "${SKIN3_DEFS}")
 	target_link_libraries(skin3 ${CPPCMS_LIB})
 
-	foreach(SKIN tc_skin_a tc_skin_b tc_skin)
+	foreach(SKIN tc_skin_a tc_skin_b tc_skin tc_sep_skin_a tc_sep_skin_b tc_sep_skin)
 		add_library(${SKIN} SHARED ${CMAKE_CURRENT_BINARY_DIR}/${SKIN}.cpp)
 		target_link_libraries(${SKIN} ${CPPCMS_LIB})
 		if(IS_WINDOWS)
@@ -631,7 +655,13 @@ set(ALL_TESTS
 	session_interface_test
 	secure_post_test
 	mount_point_test
+	todec_test
+	hash_map_test
 	)
+
+if(NOT DISABLE_PREFORK_CACHE AND NOT IS_WINDOWS)
+	set(ALL_TESTS ${ALL_TESTS} allocator_test)
+endif()
 
 if(NOT DISABLE_TCPCACHE)
 	set(ALL_TESTS ${ALL_TESTS} cache_backend_test cache_frontend_test)
@@ -712,9 +742,15 @@ install(DIRECTORY cppcms DESTINATION include
 set(CNF "${CMAKE_CURRENT_SOURCE_DIR}/tests")
 
 add_test(base64_test base64_test)
+add_test(todec_test todec_test)
 add_test(encryptor_test encryptor_test "${CNF}")
 add_test(storage_test storage_test)
 add_test(json_test json_test)
+add_test(hash_map_test hash_map_test)
+if(NOT DISABLE_PREFORK_CACHE AND NOT IS_WINDOWS)
+	add_test(allocator_test allocator_test)
+endif()
+
 add_test(multipart_parser_test multipart_parser_test "${CNF}")
 add_test(content_type_parser_test content_type_parser_test)
 if(NOT DISABLE_TCPCACHE)
@@ -727,7 +763,8 @@ add_test(url_mapper_test url_mapper_test)
 add_test(copy_filter_test copy_filter_test)
 add_test(mount_point_test mount_point_test)
 if(NOT DISABLE_SHARED)
-	add_test(tc_test tc_test)
+	add_test(tc_test_shared tc_test "--shared")
+	add_test(tc_test_separate tc_test "--separate")
 endif()
 
 add_test(status_test

@@ -25,6 +25,9 @@
 
 namespace boost = cppcms_boost;
 
+// for testing only
+//#define CPPCMS_NO_SO_SNDTIMO
+
 #if defined(__sun)  
 #  ifndef CPPCMS_NO_SO_SNDTIMO
 #    define CPPCMS_NO_SO_SNDTIMO
@@ -132,6 +135,7 @@ namespace cgi {
 			time_to_die_(0),
 			timeout_(0),
 			sync_option_is_set_(false),
+			in_watchdog_(false),
 			watchdog_(wd),
 			rewrite_(rw)
 		{
@@ -153,20 +157,6 @@ namespace cgi {
 				socket_.shutdown(io::stream_socket::shut_rdwr,e);
 			}
 		}
-		struct binder {
-			void operator()(booster::system::error_code const &e,size_t n) const
-			{
-				self_->some_headers_data_read(e,n,h_);
-			}
-			binder(booster::shared_ptr<http> self,handler const &h) :
-				self_(self),
-				h_(h)
-			{
-			}
-		private:
-			booster::shared_ptr<http> self_;
-			handler h_;
-		};
 
 		void update_time()
 		{
@@ -200,23 +190,33 @@ namespace cgi {
 
 		void async_read_some_headers(handler const &h)
 		{
-
-			input_body_.reserve(8192);
-			input_body_.resize(8192,0);
-			input_body_ptr_=0;
-			socket_.async_read_some(io::buffer(input_body_),binder(self(),h));
+			socket_.on_readable(boost::bind(&http::some_headers_data_read,self(),_1,h));
 			update_time();
 		}
 		virtual void async_read_headers(handler const &h)
 		{
 			update_time();
-			watchdog_->add(self());
+			add_to_watchdog();
 			async_read_some_headers(h);
 		}
 
-		void some_headers_data_read(booster::system::error_code const &e,size_t n,handler const &h)
+		void some_headers_data_read(booster::system::error_code const &er,handler const &h)
 		{
-			if(e) { h(e); return; }
+			if(er) { h(er); return; }
+
+			booster::system::error_code e;
+			size_t n = socket_.bytes_readable(e);
+			if(e) { h(e); return ; }
+
+			if(n > 16384)
+				n=16384;
+			if(input_body_.capacity() < n) {
+				input_body_.reserve(n);
+			}
+			input_body_.resize(input_body_.capacity(),0);
+			input_body_ptr_=0;
+			
+			n = socket_.read_some(booster::aio::buffer(input_body_),e);
 
 			total_read_+=n;
 			if(total_read_ > 16384) {
@@ -304,14 +304,18 @@ namespace cgi {
 				socket_.get_io_service().post(boost::bind(h,booster::system::error_code(),s));
 				return;
 			}
+			if(input_body_.capacity()!=0) {
+				std::vector<char> v;
+				input_body_.swap(v);
+			}
 			socket_.async_read_some(io::buffer(p,s),h);
 		}
 		virtual void async_write_eof(handler const &h)
 		{
-			watchdog_->remove(self());
+			remove_from_watchdog();
 			booster::system::error_code e;
 			socket_.shutdown(io::stream_socket::shut_wr,e);
-			socket_.get_io_service().post(boost::bind(h,booster::system::error_code()));
+			socket_.get_io_service().post(h,booster::system::error_code());
 		}
 		virtual void write_eof()
 		{
@@ -319,106 +323,70 @@ namespace cgi {
 			socket_.shutdown(io::stream_socket::shut_wr,e);
 			socket_.close(e);
 		}
-		virtual void async_write_some(void const *p,size_t s,io_handler const &h)
+		virtual void async_write(void const *p,size_t s,io_handler const &h)
 		{
 			update_time();
 			watchdog_->add(self());
 			if(headers_done_)
-				socket_.async_write_some(io::buffer(p,s),h);
+				socket_.async_write(io::buffer(p,s),h);
 			else
 				process_output_headers(p,s,h);
 		}
-		virtual size_t write_some(void const *p,size_t n,booster::system::error_code &e)
+		virtual size_t write(void const *p,size_t n,booster::system::error_code &e)
 		{
 			if(headers_done_) 
-				return write_some_to_socket(io::buffer(p,n),e);	
+				return write_to_socket(io::buffer(p,n),e);	
 			return process_output_headers(p,n);
 		}
 		#ifndef CPPCMS_NO_SO_SNDTIMO
-		// using SO_SNDTIMO on almost all platforms
-		size_t write_some_to_socket(booster::aio::const_buffer const &buf,booster::system::error_code &e)
+		size_t timed_write_some(booster::aio::const_buffer const &buf,booster::system::error_code &e)
 		{
 			set_sync_options(e);
 			if(e) return 0;
-			booster::ptime start = booster::ptime::now();
-			size_t n = socket_.write_some(buf,e);
-			booster::ptime end = booster::ptime::now();
-			// it may actually return with success but return small
-			// a small buffer
-			if(booster::ptime::to_number(end - start) >= timeout_ - 0.1) {
-				die(); 
-				return n;
-			}
-			if(e  && (io::basic_socket::would_block(e) 
-				#ifdef CPPCMS_WIN32
-				|| e.value() == 10060   // WSAETIMEDOUT - do not want to include windows.h
-				#endif
-				)
-				) { 
-				// handle timeout with SO_SNDTIMEO
-				// that responds with EAGIAN or EWOULDBLOCK
-				die();
-			}
-			return n;
+			return socket_.write_some(buf,e);
 		}
-		#else 
-		// we need to fallback to poll, fortunatelly only on some Unixes like Solaris, so we can use poll(2)
-		size_t write_some_to_socket(booster::aio::const_buffer const &buf,booster::system::error_code &e)
+		#else
+		size_t timed_write_some(booster::aio::const_buffer const &buf,booster::system::error_code &e)
 		{
-			size_t n = socket_.write_some(buf,e);
-			if(!e || !io::basic_socket::would_block(e))
-				return n;
 			booster::ptime start = booster::ptime::now();
 
 			pollfd pfd=pollfd();
 			pfd.fd = socket_.native();
 			pfd.events = POLLOUT;
+			pfd.revents = 0;
 			int msec = timeout_ * 1000;
-			int msec_total = msec;
-			for(;;) {
-				int r = poll(&pfd,1,msec);
-
-				// handle restart after EINTR
-				if(r < 0) {
-					if(errno == EINTR) {
-						int passed = int(booster::ptime::to_number(booster::ptime::now() - start)*1000);
-						msec = msec_total - passed; 
-						if(msec < 0)
-							msec = 0;
-						continue;
-					}
-					e = booster::system::error_code(errno,booster::system::system_category);
-					return 0;
+			int r = 0;
+			while((r=poll(&pfd,1,msec))<0 && errno==EINTR) {
+				msec -=  booster::ptime::milliseconds(booster::ptime::now() - start);
+				if(msec <= 0) {
+					r = 0;
+					break;
 				}
-				else if(r == 0) {
-					// timeout :-(
-					e=booster::system::error_code(errc::protocol_violation,cppcms_category);
-					die();
-					return 0;
-				}
-				// check if we can write
-				if(pfd.revents & POLLOUT) {
-					e = booster::system::error_code();
-					n = socket_.write_some(buf,e);
-					// restart polling if we get would_block again
-					if(n == 0 && io::basic_socket::would_block(e))
-						continue;
-					return n;
-				}
-				e=booster::system::error_code(booster::aio::aio_error::select_failed,booster::aio::aio_error_cat);
+			}
+			if(r < 0) {
+				e=booster::system::error_code(errno,booster::system::system_category);
 				return 0;
 			}
+			if(pfd.revents & POLLOUT)
+				return socket_.write_some(buf,e);
+			e=booster::system::error_code(errc::protocol_violation,cppcms_category);
+			return 0;
 		}
 		#endif
-		size_t write_to_socket(booster::aio::const_buffer buf,booster::system::error_code &e)
+		size_t write_to_socket(booster::aio::const_buffer const &bufin,booster::system::error_code &e)
 		{
-			size_t res = 0;
-			while(!buf.empty() && !e) {
-				size_t n = write_some_to_socket(buf,e);
+			booster::aio::const_buffer buf = bufin;
+			size_t total = 0;
+			while(!buf.empty()) {
+				size_t n = timed_write_some(buf,e);
+				total += n;
 				buf += n;
-				res += n;
+				if(e) {
+					die();
+					break;
+				}
 			}
-			return res;
+			return total;
 		}
 		void set_sync_options(booster::system::error_code &e)
 		{
@@ -611,7 +579,7 @@ namespace cgi {
 		}
 		void on_async_read_complete()
 		{
-			watchdog_->remove(self());
+			remove_from_watchdog();
 		}
 		void error_response(char const *message,handler const &h)
 		{
@@ -687,6 +655,22 @@ namespace cgi {
 		time_t time_to_die_;
 		int timeout_;
 		bool sync_option_is_set_;
+		bool in_watchdog_;
+
+		void add_to_watchdog()
+		{
+			if(!in_watchdog_) {
+				watchdog_->add(self());
+				in_watchdog_ = true;
+			}
+		}
+		void remove_from_watchdog()
+		{
+			if(in_watchdog_) {
+				watchdog_->remove(self());
+				in_watchdog_ = false;
+			}
+		}
 
 		booster::shared_ptr<http_watchdog> watchdog_;
 		booster::shared_ptr<url_rewriter> rewrite_;

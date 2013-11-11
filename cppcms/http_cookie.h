@@ -79,10 +79,6 @@ public:
 	void comment(std::string);
 
 	///
-	/// Set expiration date/time
-	///
-	void expires(time_t when);
-	///
 	/// Set max cookie's age
 	///
 	void max_age(unsigned a);
@@ -141,8 +137,7 @@ private:
 
 	uint32_t secure_	: 1;
 	uint32_t has_age_	: 1;
-	uint32_t has_expiration_: 1;
-	uint32_t reserved_	: 29;
+	uint32_t reserved_	: 30;
 };
 
 

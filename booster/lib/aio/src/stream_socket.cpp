@@ -9,6 +9,15 @@
 #include "socket_details.h"
 #include <booster/aio/socket.h>
 
+#ifndef BOOSTER_WIN32
+#include <sys/ioctl.h>
+#endif
+
+#ifdef __sun
+// for FIONREAD
+#include <sys/filio.h>
+#endif
+
 //#define BOOSTER_AIO_FORCE_POLL
 
 
@@ -370,8 +379,7 @@ namespace {
 			count+=n;
 			buf+=n;
 			if(buf.empty() || (e && !basic_io_device::would_block(e))) {
-				io_binder::pointer binder(new io_binder( h, count, e));
-				self->get_io_service().post(binder);
+				self->get_io_service().post(h,e,count);
 			}
 			else {
 				self->on_readable(intrusive_ptr<reader_all>(this));
@@ -408,9 +416,9 @@ namespace {
 	struct writer_all : public callable<void(system::error_code const &e)> 
 	{
 		typedef intrusive_ptr<writer_all> pointer;
-		writer_all(stream_socket *s,const_buffer const &b,io_handler const &handler) :
-			buf(b),
-			count(0),
+		writer_all(stream_socket *s,const_buffer const &b,size_t n,io_handler const &handler) :
+			buf(b + n),
+			count(n),
 			self(s),
 			h(handler)
 		{
@@ -429,8 +437,7 @@ namespace {
 			count+=n;
 			buf+=n;
 			if(buf.empty() || (e && !basic_io_device::would_block(e))) {
-				io_binder::pointer binder(new io_binder( h, count, e ));
-				self->get_io_service().post(binder);
+				self->get_io_service().post(h,e,count);
 			}
 			else {
 				self->on_writeable(intrusive_ptr<writer_all>(this));
@@ -482,8 +489,7 @@ void stream_socket::async_write_some(const_buffer const &buffer,io_handler const
 		on_writeable(writer);
 	}
 	else {
-		io_binder::pointer binder(new io_binder( h,n,e ));
-		get_io_service().post(binder);
+		get_io_service().post(h,e,n);
 	}
 	#endif
 }
@@ -503,8 +509,7 @@ void stream_socket::async_read_some(mutable_buffer const &buffer,io_handler cons
 		on_readable(reader);
 	}
 	else {
-		io_binder::pointer binder(new io_binder( h,n,e ));
-		get_io_service().post(binder);
+		get_io_service().post(h,e,n);
 	}
 	#endif
 }
@@ -520,8 +525,7 @@ void stream_socket::async_connect(endpoint const &ep,event_handler const &h)
 		on_writeable(connector);
 	}
 	else {
-		event_binder::pointer binder(new event_binder( h,e ));
-		get_io_service().post(binder);
+		get_io_service().post(h,e);
 	}
 }
 
@@ -538,10 +542,56 @@ void stream_socket::async_write(const_buffer const &buffer,io_handler const &h)
 {
 	if(!dont_block(h))
 		return;
-	writer_all::pointer r(new writer_all(this,buffer,h));
+
+	#ifdef BOOSTER_AIO_FORCE_POLL
+	writer_all::pointer r(new writer_all(this,buffer,0,h));
 	r->run();
+	#else
+	system::error_code e;
+	size_t n = write_some(buffer,e);
+	if((!e && n!=buffer.bytes_count()) || (e && would_block(e))) {
+		writer_all::pointer r(new writer_all(this,buffer,n,h));
+		r->run();
+	}
+	else {
+		get_io_service().post(h,e,n);
+	}
+	#endif
+
+
+
+
 }
 
+size_t stream_socket::bytes_readable(booster::system::error_code &e)
+{
+	#ifdef BOOSTER_WIN32
+	unsigned long size = 0;
+	int r = ::ioctlsocket(native(),FIONREAD,&size);
+	if(r != 0) {
+		e=geterror();
+		return 0;
+	}
+	return size;
+	#else
+	int size = 0;
+	int r = ::ioctl(native(),FIONREAD,&size);
+	if(r < 0) {
+		e=geterror();
+		return 0;
+	}
+	return size;
+	#endif
+}
+
+size_t stream_socket::bytes_readable()
+{
+	booster::system::error_code e;
+	size_t r = bytes_readable(e);
+	if(e)
+		throw booster::system::system_error(e);
+	return r;
+}
 
 void socket_pair(stream_socket &s1,stream_socket &s2,system::error_code &e)
 {

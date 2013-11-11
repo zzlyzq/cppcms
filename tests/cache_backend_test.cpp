@@ -25,8 +25,6 @@ void ssleep(int x) { sleep(x); }
 #endif
 
 
-
-
 void test_cache(booster::intrusive_ptr<cppcms::impl::base_cache> cache,bool test_generators=true)
 {
 	std::string tmp;
@@ -120,7 +118,7 @@ int main()
 		std::cout << "Ok" << std::endl;
 		#if !defined(CPPCMS_WIN32) && !defined(CPPCMS_NO_PREFOK_CACHE)
 		std::cout << "Testing process cache... " << std::flush;
-		test_cache(cppcms::impl::process_cache_factory(16*1024,20));
+		test_cache(cppcms::impl::process_cache_factory(16*1024*1024,20));
 		std::cout << "Ok" << std::endl;
 		#endif
 		

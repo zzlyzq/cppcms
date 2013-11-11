@@ -27,12 +27,13 @@
 #include <map>
 #include <list>
 #include <limits>
+#include <memory>
 #include <time.h>
 #include <cppcms/cstdint.h>
 
+#include "hash_map.h"
 
-#include <cppcms_boost/unordered/unordered_map.hpp>
-namespace boost = cppcms_boost;
+#include <string.h>
 
 namespace cppcms {
 namespace impl {
@@ -54,6 +55,14 @@ struct copy_traits<std::string>
 {
 	static std::string to_int(std::string const &a) { return a; }
 	static std::string to_std(std::string const &a) { return a; }
+};
+
+struct string_equal {
+	template<typename S1,typename S2>
+	bool operator()(S1 const &s1,S2 const &s2) const
+	{
+		return s1.size() == s2.size() && memcmp(s1.c_str(),s2.c_str(),s1.size()) == 0;
+	}
 };
 
 #ifndef CPPCMS_NO_PREFOK_CACHE
@@ -137,11 +146,11 @@ class mem_cache : public base_cache {
 
 	typedef std::basic_string<char,std::char_traits<char>,allocator > string_type;
 
-	typedef boost::unordered_map<
+	typedef hash_map<
 			string_type,
 			container,
-			boost::hash<string_type>,
-			std::equal_to<string_type>,
+			string_hash,
+			string_equal,
 			typename allocator::template rebind<std::pair<const string_type,container> >::other
 		> map_type;
 
@@ -150,18 +159,24 @@ class mem_cache : public base_cache {
 	typedef std::list<
 			pointer,
 			typename allocator::template rebind<pointer>::other
-		> lru_list_type;
+		> pointer_list_type;
 
-	typedef std::multimap<
+	typedef hash_map<
 			string_type,
-			pointer,
-			std::less<string_type>,
-			typename allocator::template rebind<std::pair<const string_type,pointer> >::other
+			pointer_list_type,
+			string_hash,
+			string_equal,
+			typename allocator::template rebind<std::pair<const string_type,pointer_list_type> >::other
 		> triggers_map_type;
 
-	typedef std::list<
+	typedef std::pair<
 			typename triggers_map_type::iterator,
-			typename allocator::template rebind<typename triggers_map_type::iterator>::other
+			typename pointer_list_type::iterator
+		> trigger_ptr_type;
+
+	typedef std::list<
+			trigger_ptr_type,
+			typename allocator::template rebind<trigger_ptr_type>::other
 		> triggers_list_type;
 
 	typedef std::multimap<
@@ -174,7 +189,7 @@ class mem_cache : public base_cache {
 	struct container {
 		string_type data;
 		typedef typename map_type::iterator pointer;
-		typename lru_list_type::iterator lru;
+		typename pointer_list_type::iterator lru;
 		triggers_list_type triggers;
 		typename timeout_mmap_type::iterator timeout;
 		uint64_t generation;
@@ -185,10 +200,11 @@ class mem_cache : public base_cache {
 	typedef typename triggers_map_type::iterator triggers_ptr;
 	timeout_mmap_type timeout;
 	typedef typename timeout_mmap_type::iterator timeout_ptr;
-	lru_list_type lru;
-	typedef typename lru_list_type::iterator lru_ptr;
+	pointer_list_type lru;
+	typedef typename pointer_list_type::iterator lru_ptr;
 	unsigned limit;
 	size_t size;
+	size_t triggers_count;
 	int refs;
 	uint64_t generation;
 
@@ -207,7 +223,10 @@ class mem_cache : public base_cache {
 		timeout.erase(p->second.timeout);
 		typename triggers_list_type::iterator i;
 		for(i=p->second.triggers.begin();i!=p->second.triggers.end();i++) {
-			triggers.erase(*i);
+			i->first->second.erase(i->second);
+			triggers_count --;
+			if(i->first->second.empty())
+				triggers.erase(i->first);
 		}
 		primary.erase(p);
 		size--;
@@ -239,7 +258,7 @@ public:
 		time_t now;
 		time(&now);
 
-		if((p=primary.find(to_int(key)))==primary.end() || p->second.timeout->first < now) {
+		if((p=primary.find(key))==primary.end() || p->second.timeout->first < now) {
 			return false;
 		}
 
@@ -256,7 +275,7 @@ public:
 		if(triggers) {
 			typename triggers_list_type::iterator tp;
 			for(tp=p->second.triggers.begin();tp!=p->second.triggers.end();tp++) {
-				triggers->insert(to_std((*tp)->first));
+				triggers->insert(to_std(tp->first->first));
 			}
 		}
 
@@ -272,11 +291,12 @@ public:
 	virtual void rise(std::string const &trigger)
 	{
 		wrlock_guard lock(*access_lock);
-		std::pair<triggers_ptr,triggers_ptr> range=triggers.equal_range(to_int(trigger));
-		triggers_ptr p;
+		triggers_ptr p = triggers.find(trigger);
+		if(p==triggers.end())
+			return;
 		std::list<pointer> kill_list;
-		for(p=range.first;p!=range.second;p++) {
-			kill_list.push_back(p->second);
+		for(typename pointer_list_type::iterator it=p->second.begin();it!=p->second.end();++it) {
+			kill_list.push_back(*it);
 		}
 		typename std::list<pointer>::iterator lptr;
 
@@ -289,9 +309,11 @@ public:
 		timeout.clear();
 		lru.clear();
 		primary.clear();
+		primary.rehash(limit);
 		triggers.clear();
-		primary.rehash( (limit+1) / primary.max_load_factor() + 1);
+		triggers.rehash(limit);
 		size = 0;
+		triggers_count = 0;
 	}
 	virtual void clear()
 	{
@@ -302,7 +324,7 @@ public:
 	{
 		rdlock_guard lock(*access_lock);
 		keys=size;
-		triggers=this->triggers.size();
+		triggers = triggers_count;
 	}
 	void check_limits()
 	{
@@ -326,10 +348,20 @@ public:
 	virtual void remove(std::string const &key)
 	{
 		wrlock_guard lock(*access_lock);
-		pointer p=primary.find(to_int(key));
+		pointer p=primary.find(key);
 		if(p==primary.end())
 			return;
 		delete_node(p);
+	}
+
+	void add_trigger(pointer p,std::string const &key)
+	{
+		std::pair<string_type,pointer_list_type> tr(to_int(key),pointer_list_type());
+		std::pair<triggers_ptr,bool> r=triggers.insert(tr);
+		triggers_ptr it = r.first;
+		it->second.push_front(p);
+		p->second.triggers.push_back(trigger_ptr_type(it,it->second.begin()));
+		triggers_count++;
 	}
 
 	virtual void store(	std::string const &key,
@@ -338,10 +370,19 @@ public:
 				time_t timeout_in,
 				uint64_t const *gen)
 	{
+		string_type ar;
+		try {
+			string_type tmp = to_int(a);
+			ar.swap(tmp);
+		}
+		catch(std::bad_alloc const &) {
+			return;
+		}
+
 		wrlock_guard lock(*access_lock);
 		try {
 			pointer main;
-			main=primary.find(to_int(key));
+			main=primary.find(key);
 			if(main!=primary.end())
 				delete_node(main);
 			if(size > size_limit())
@@ -353,7 +394,7 @@ public:
 			size ++;
 			main=res.first;
 			container &cont=main->second;
-			cont.data=to_int(a);
+			cont.data.swap(ar);
 			if(gen)
 				cont.generation=*gen;
 			else
@@ -362,11 +403,11 @@ public:
 			cont.lru=lru.begin();
 			cont.timeout=timeout.insert(std::pair<time_t,pointer>(timeout_in,main));
 			if(triggers_in.find(key)==triggers_in.end()){
-				cont.triggers.push_back(triggers.insert(std::pair<string_type,pointer>(int_key,main)));
+				add_trigger(main,key);
 			}
 			std::set<std::string>::const_iterator si;
 			for(si=triggers_in.begin();si!=triggers_in.end();si++) {
-				cont.triggers.push_back(triggers.insert(std::pair<string_type,pointer>(to_int(*si),main)));
+				add_trigger(main,*si);
 			}
 		}
 		catch(std::bad_alloc const &e)

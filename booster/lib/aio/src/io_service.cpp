@@ -28,6 +28,7 @@
 #include <map>
 #include <deque>
 #include <list>
+#include <algorithm>
 
 #include "select_iterrupter.h"
 
@@ -59,7 +60,7 @@ typedef unique_lock<recursive_mutex> lock_guard;
 
 		bool is_valid(native_type fd)
 		{
-			return 0 <= fd && fd <=65535;
+			return fd >= 0;
 		}
 
 		Cont &operator[](native_type fd)
@@ -112,6 +113,93 @@ typedef unique_lock<recursive_mutex> lock_guard;
 
 class event_loop_impl {
 public:
+	
+	struct completion_handler {
+		booster::intrusive_ptr<booster::refcounted> h;
+		booster::system::error_code e;
+		size_t n;
+		void (*type)(completion_handler *self);
+
+		completion_handler() : 
+			n(0),
+			type(&completion_handler::op_none) 
+		{
+		}
+		completion_handler(handler const &inh) :
+			h(inh.get_pointer()),
+			n(0),
+			type(&completion_handler::op_handler)
+		{
+		}
+		completion_handler(handler &inh) :
+			h(inh.get_pointer().release(),false),
+			n(0),
+			type(&completion_handler::op_handler)
+		{
+		}
+		completion_handler(event_handler const &inh,booster::system::error_code const &ine) : 
+			h(inh.get_pointer()),
+			e(ine),
+			n(0),
+			type(&completion_handler::op_event_handler) 
+		{
+		}
+		completion_handler(event_handler &inh,booster::system::error_code const &ine) : 
+			h(inh.get_pointer().release(),false),
+			e(ine),
+			n(0),
+			type(&completion_handler::op_event_handler) 
+		{
+		}
+		completion_handler(io_handler const &inh,booster::system::error_code const &ine,size_t inn) : 
+			h(inh.get_pointer()),
+			e(ine),
+			n(inn),
+			type(&completion_handler::op_io_handler) 
+		{
+		}
+		completion_handler(io_handler &inh,booster::system::error_code const &ine,size_t inn) : 
+			h(inh.get_pointer().release(),false),
+			e(ine),
+			n(inn),
+			type(&completion_handler::op_io_handler) 
+		{
+		}
+
+		void operator()() 
+		{
+			type(this);
+		}
+		static void op_none(completion_handler *)
+		{
+		}
+		static void op_handler(completion_handler *self)
+		{
+			booster::refcounted &call = *self->h;
+			static_cast<handler::callable_type &>(call)();
+		}
+		static void op_event_handler(completion_handler *self)
+		{
+			booster::refcounted &call = *self->h;
+			static_cast<event_handler::callable_type &>(call)(self->e);
+		}
+		static void op_io_handler(completion_handler *self)
+		{
+			booster::refcounted &call = *self->h;
+			static_cast<io_handler::callable_type &>(call)(self->e,self->n);
+		}
+
+
+
+
+
+		void swap(completion_handler &other) {
+			h.swap(other.h);
+			std::swap(e,other.e);
+			std::swap(n,other.n);
+			std::swap(type,other.type);
+		}
+	};
 	
 	void set_io_event(native_type fd,int event,event_handler const &h)
 	{
@@ -169,7 +257,21 @@ public:
 	void post(handler const &h)
 	{
 		lock_guard l(data_mutex_);
-		dispatch_queue_.push_back(h);
+		dispatch_queue_.push_back(completion_handler(h));
+		if(polling_)
+			wake();
+	}
+	void post(event_handler const &h,booster::system::error_code const &e)
+	{
+		lock_guard l(data_mutex_);
+		dispatch_queue_.push_back(completion_handler(h,e));
+		if(polling_)
+			wake();
+	}
+	void post(io_handler const &h,booster::system::error_code const &e,size_t n)
+	{
+		lock_guard l(data_mutex_);
+		dispatch_queue_.push_back(completion_handler(h,e,n));
 		if(polling_)
 			wake();
 	}
@@ -231,7 +333,7 @@ public:
 
 		timer_events_type::iterator evptr = timer_events_index_[event_id];
 		
-		event_handler_dispatcher evdisp(evptr->second.h,system::error_code(aio_error::canceled,aio_error_cat));
+		completion_handler evdisp(evptr->second.h,system::error_code(aio_error::canceled,aio_error_cat));
 		dispatch_queue_.push_back(evdisp);
 		timer_events_.erase(evptr);
 		timer_events_index_[event_id]=timer_events_.end();
@@ -281,7 +383,7 @@ private:
 	//
 	socket_map<io_data> map_;
 	// events dispatch queue
-	std::deque<handler> dispatch_queue_;
+	std::deque<completion_handler> dispatch_queue_;
 
 	void closesocket(native_type fd)
 	{
@@ -322,9 +424,9 @@ private:
 			e = system::error_code(aio_error::canceled,aio_error_cat);
 			// Maybe it is closed
 			if(cont.readable)
-				self_->dispatch_queue_.push_back(event_handler_dispatcher(cont.readable,e));
+				self_->dispatch_queue_.push_back(completion_handler(cont.readable,e));
 			if(cont.writeable)
-				self_->dispatch_queue_.push_back(event_handler_dispatcher(cont.writeable,e));
+				self_->dispatch_queue_.push_back(completion_handler(cont.writeable,e));
 			self_->map_.erase(fd);
 		}
 	};
@@ -348,7 +450,7 @@ private:
 				#else
 				system::error_code e(EBADF,syscat);
 				#endif
-				self_->dispatch_queue_.push_back(event_handler_dispatcher(h,e));
+				self_->dispatch_queue_.push_back(completion_handler(h,e));
 				return;
 			}
 
@@ -363,7 +465,7 @@ private:
 					self_->map_[fd].writeable = h;
 			}
 			else {
-				self_->dispatch_queue_.push_back(event_handler_dispatcher(h,e));
+				self_->dispatch_queue_.push_back(completion_handler(h,e));
 			}
 		}
 	};
@@ -408,7 +510,7 @@ private:
 	{
 		lock_guard l(data_mutex_);
 		if(polling_ || !reactor_.get()) {
-			dispatch_queue_.push_back(f);
+			dispatch_queue_.push_back(completion_handler(f));
 			if(reactor_.get())
 				wake();
 		}
@@ -422,7 +524,7 @@ private:
 		if(!f.cancelation_is_needed_with_data_mutex_locked())
 			return;
 		if(polling_ || !reactor_.get()) {
-			dispatch_queue_.push_back(f);
+			dispatch_queue_.push_back(completion_handler(f));
 			if(reactor_.get())
 				wake();
 		}
@@ -430,19 +532,6 @@ private:
 			f();
 		}
 	}
-
-	struct event_handler_dispatcher {
-		event_handler_dispatcher(event_handler &hn,system::error_code const &err) : e(err)
-		{
-			h.swap(hn);
-		}
-		event_handler h;
-		system::error_code e;
-		void operator()() const
-		{
-			h(e);
-		}
-	};
 
 	bool run_one(reactor::event *evs,size_t evs_size)
 	{
@@ -456,7 +545,7 @@ private:
 
 		int counter = dispatch_queue_.size();
 		while(!stop_ && !dispatch_queue_.empty() && counter > 0) {
-			handler exec;
+			completion_handler exec;
 			exec.swap(dispatch_queue_.front());
 			dispatch_queue_.pop_front();
 			
@@ -478,7 +567,7 @@ private:
 		while(!stop_ && !timer_events_.empty() && timer_events_.begin()->first <= now) {
 			timer_events_type::iterator evptr = timer_events_.begin();
 			timer_events_index_[evptr->second.event_id] = timer_events_.end();
-			event_handler_dispatcher disp(evptr->second.h,system::error_code());
+			completion_handler disp(evptr->second.h,system::error_code());
 			dispatch_queue_.push_back(disp);
 			timer_events_.erase(evptr);
 		}
@@ -569,10 +658,12 @@ private:
 			
 			cont.current_event = new_events;
 
-			if(cont.readable && (new_events & reactor::in) == 0)
-				dispatch_queue_.push_back(event_handler_dispatcher(cont.readable,dispatch_error));
-			if(cont.writeable && (new_events & reactor::out) == 0)
-				dispatch_queue_.push_back(event_handler_dispatcher(cont.writeable,dispatch_error));
+			if(cont.readable && (new_events & reactor::in) == 0) {
+				dispatch_queue_.push_back(completion_handler(cont.readable,dispatch_error));
+			}
+			if(cont.writeable && (new_events & reactor::out) == 0) {
+				dispatch_queue_.push_back(completion_handler(cont.writeable,dispatch_error));
+			}
 			
 			if(new_events == 0)
 				map_.erase(evs[i].fd);
@@ -642,6 +733,17 @@ void io_service::post(handler const &h)
 {
 	impl_->post(h);
 }
+
+void io_service::post(event_handler const &h,booster::system::error_code const &e)
+{
+	impl_->post(h,e);
+}
+
+void io_service::post(io_handler const &h,booster::system::error_code const &e,size_t n)
+{
+	impl_->post(h,e,n);
+}
+
 
 int io_service::set_timer_event(ptime const &t,event_handler const &h)
 {

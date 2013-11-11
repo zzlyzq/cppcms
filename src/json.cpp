@@ -19,14 +19,6 @@
 #include <stack>
 #include "utf_iterator.h"
 
-#include <cppcms/config.h>
-#ifdef CPPCMS_USE_EXTERNAL_BOOST
-#   include <boost/variant.hpp>
-#else // Internal Boost
-#   include <cppcms_boost/variant.hpp>
-    namespace boost = cppcms_boost;
-#endif
-
 namespace cppcms {
 namespace json {
 
@@ -60,15 +52,236 @@ namespace json {
 		return msg_.c_str();
 	}
 
-	typedef boost::variant<
-			undefined,
-			null,
-			bool,
-			double,
-			std::string,
-			json::object,
-			json::array
-		>  variant_type;
+	template<typename T>
+	struct json_type_traits;
+	template<>
+	struct json_type_traits<undefined> { static const json_type type=is_undefined; };
+	template<>
+	struct json_type_traits<null> { static const json_type type=is_null; };
+	template<>
+	struct json_type_traits<bool> { static const json_type type=is_boolean; };
+	template<>
+	struct json_type_traits<double> { static const json_type type=is_number; };
+	template<>
+	struct json_type_traits<array> { static const json_type type=is_array; };
+	template<>
+	struct json_type_traits<object> { static const json_type type=is_object; };
+	template<>
+	struct json_type_traits<std::string> { static const json_type type=is_string; };
+
+	template<json_type t>
+	struct cpp_type_traits;
+
+	template<> struct cpp_type_traits<is_boolean> { typedef bool type; };
+	template<> struct cpp_type_traits<is_number> { typedef double type; };
+	template<> struct cpp_type_traits<is_string> { typedef std::string type; };
+	template<> struct cpp_type_traits<is_array> { typedef array type; };
+	template<> struct cpp_type_traits<is_object> { typedef object type; };
+
+	class variant {
+	public:
+		union memory {
+			void *p;
+			bool bv;
+			double dv;
+			char s[sizeof(std::string)];
+			char a[sizeof(json::array)];
+			char o[sizeof(json::object)];
+		} m;
+
+		void *ptr()
+		{
+			return static_cast<void *>(&m);
+		}
+		void const *ptr() const
+		{
+			return static_cast<void const *>(&m);
+		}
+
+		json_type which() const 
+		{
+			return type;
+		}
+
+		json_type type;
+
+		bool operator==(variant const &other) const
+		{
+			if(type != other.type)
+				return false;
+			switch(type) {
+			case is_boolean:
+				return get<bool>() == other.get<bool>();
+			case is_number:
+				return get<double>() == other.get<double>();
+			case is_string:
+				return get<std::string>() == other.get<std::string>();
+			case is_object:
+				return get<object>() == other.get<object>();
+			case is_array:
+				return get<array>() == other.get<array>();
+			default:
+				return true;
+			}
+		}
+
+		variant()
+		{
+			create(is_undefined);
+		}
+
+		~variant()
+		{
+			destroy();
+		}
+
+		variant(variant const &other) 
+		{
+			create(other.type,other.m);
+		}
+		variant &operator=(variant const &other) 
+		{
+			if(this!=&other) {
+				destroy();
+				create(other.type,other.m);
+			}
+			return *this;
+		}
+
+		template<typename T>
+		T &get()
+		{
+			json_type expected = json_type_traits<T>::type;
+			if(expected != type) 
+				throw bad_value_cast("invalid type",expected,type);
+			switch(type) {
+			case is_undefined:
+			case is_null:
+				throw bad_value_cast("non-fetchable type",type);
+			default:
+				return *static_cast<T *>(ptr());
+			}
+		}
+		template<typename T>
+		T const &get() const
+		{
+			json_type expected = json_type_traits<T>::type;
+			if(expected != type) 
+				throw bad_value_cast("invalid type",expected,type);
+			switch(type) {
+			case is_undefined:
+			case is_null:
+				throw bad_value_cast("non-fetchable type",type);
+			default:
+				return *static_cast<T const *>(ptr());
+			}
+		}
+
+		template<typename T>
+		variant(T const &v)
+		{
+			create<T>(v);
+		}
+
+		template<typename T>
+		variant &operator=(T const &other)
+		{
+			destroy();
+			create<T>(other);
+			return *this;
+		}
+
+		template<typename T>
+		void create(T const &v)
+		{
+			void *p=ptr();
+			type = json_type_traits<T>::type;
+			switch(type) {
+			case is_undefined:
+			case is_null:
+			case is_boolean:
+			case is_number:
+				memcpy(&m,&v,sizeof(T));
+				break;
+			case is_string:
+				new(p) std::string(reinterpret_cast<std::string const &>(v));
+				break;
+			case is_object:
+				new(p) object(reinterpret_cast<object const &>(v));
+				break;
+			case is_array:
+				new(p) array(reinterpret_cast<array const &>(v));
+				break;
+			}
+		}
+		
+		void create(json_type t)
+		{
+			type = t;
+			memset(ptr(),0,sizeof(m));
+			switch(type) {
+			case is_undefined:
+			case is_null:
+			case is_boolean:
+			case is_number:
+				break;
+			case is_string:
+				new(ptr()) std::string();
+				break;
+			case is_object:
+				new(ptr()) object();
+				break;
+			case is_array:
+				new(ptr()) array();
+				break;
+			}
+		}
+		void create(json_type t,memory const &other)
+		{
+			void *p=&m;
+			type = t;
+			switch(t) {
+			case is_undefined:
+			case is_null:
+			case is_boolean:
+			case is_number:
+				memcpy(&m,&other,sizeof(m));
+				break;
+			case is_string:
+				new(p) std::string(reinterpret_cast<std::string const &>(other));
+				break;
+			case is_object:
+				new(p) object(reinterpret_cast<object const &>(other));
+				break;
+			case is_array:
+				new(p) array(reinterpret_cast<array const &>(other));
+				break;
+			}
+		}
+		void destroy()
+		{
+			typedef std::string string_type;
+			switch(type) {
+			case is_undefined:
+			case is_null:
+			case is_boolean:
+			case is_number:
+				break;
+			case is_string:
+				static_cast<string_type *>(ptr())->~string_type();
+				break;
+			case is_object:
+				static_cast<object *>(ptr())->~object();
+				break;
+			case is_array:
+				static_cast<array *>(ptr())->~array();
+				break;
+			}
+			memset(&m,0,sizeof(m));
+		}
+	};
+
+	typedef variant variant_type;
 
 	struct value::_data {
 	public:
@@ -104,69 +317,48 @@ namespace json {
 			d=r.d;
 		return *this;
 	}
-	
-	template<typename T>
-	T &get_variant_value(variant_type &v)
-	{
-		try {
-			return boost::get<T>(v);
-		}
-		catch(boost::bad_get const &e) {
-			throw bad_value_cast("",json_type(v.which()));
-		}
-	}
-	template<typename T>
-	T const &get_variant_value(variant_type const &v)
-	{
-		try {
-			return boost::get<T>(v);
-		}
-		catch(boost::bad_get const &e) {
-			throw bad_value_cast("",json_type(v.which()));
-		}
-	}
 
 	double const &value::number() const
 	{
-		return get_variant_value<double>(d->value());
+		return d->value().get<double>();
 	}
 	bool const &value::boolean() const
 	{
-		return get_variant_value<bool>(d->value());
+		return d->value().get<bool>();
 	}
 	std::string const &value::str() const
 	{
-		return get_variant_value<std::string>(d->value());
+		return d->value().get<std::string>();
 	}
 
 	json::object const &value::object() const
 	{
-		return get_variant_value<json::object>(d->value());
+		return d->value().get<json::object>();
 	}
 	json::array const &value::array() const
 	{
-		return get_variant_value<json::array>(d->value());
+		return d->value().get<json::array>();
 	}
 	double &value::number() 
 	{
-		return get_variant_value<double>(d->value());
+		return d->value().get<double>();
 	}
 	bool &value::boolean()
 	{
-		return get_variant_value<bool>(d->value());
+		return d->value().get<bool>();
 	}
 	std::string &value::str()
 	{
-		return get_variant_value<std::string>(d->value());
+		return d->value().get<std::string>();
 	}
 
 	json::object &value::object()
 	{
-		return get_variant_value<json::object>(d->value());
+		return d->value().get<json::object>();
 	}
 	json::array &value::array()
 	{
-		return get_variant_value<json::array>(d->value());
+		return d->value().get<json::array>();
 	}
 
 	bool value::is_undefined() const
@@ -210,47 +402,89 @@ namespace json {
 
 	json_type value::type() const
 	{
-		return json_type(d->value().which());
+		return d->value().which();
+	}
+	namespace details {
+	
+		template<typename Appender>
+		void generic_append(char const *begin,char const *end,Appender &a)
+		{
+			a.append('"');
+			char const *i,*last;
+			char buf[8] = "\\u00";
+			for(i=begin,last = begin;i!=end;) {
+				char const *addon = 0;
+				unsigned char c=*i;
+				switch(c) {
+				case 0x22: addon = "\\\""; break;
+				case 0x5C: addon = "\\\\"; break;
+				case '\b': addon = "\\b"; break;
+				case '\f': addon = "\\f"; break;
+				case '\n': addon = "\\n"; break;
+				case '\r': addon = "\\r"; break;
+				case '\t': addon = "\\t"; break;
+				default:
+					if(c<=0x1F) {
+						static char const tohex[]="0123456789abcdef";
+						buf[4]=tohex[c >>  4];
+						buf[5]=tohex[c & 0xF];
+						buf[6]=0;
+						addon = buf;
+					}
+				};
+				if(addon) {
+					a.append(last,i-last);
+					a.append(addon);
+					i++;
+					last = i;
+				}
+				else {
+					i++;
+				}
+			}
+			a.append(last,i-last);
+			a.append('"');
+		}
+
+		struct string_append {
+			std::string *out;
+			void append(char c) { *out += c; }
+			void append(char const *s,size_t n) { out->append(s,n); }
+			void append(char const *s) { out->append(s); }
+		};
+
+		struct stream_append {
+			std::ostream *out;
+			void append(char c) { *out << c; }
+			void append(char const *s,size_t n) { out->write(s,n); }
+			void append(char const *s) { *out << s; }
+		};
+	
+	}
+
+	std::string CPPCMS_API to_json(char const *begin,char const *end)
+	{
+		std::string result;
+		result.reserve(end-begin + 2);
+		details::string_append ap = { &result };
+		details::generic_append(begin,end,ap);
+		return result;
+	}
+	std::string CPPCMS_API to_json(std::string const &s)
+	{
+		return to_json(s.c_str(),s.c_str()+s.size());
+	}
+	void CPPCMS_API to_json(char const *begin,char const *end,std::ostream &out)
+	{
+		details::stream_append ap = { &out };
+		details::generic_append(begin,end,ap);
+	}
+	void CPPCMS_API to_json(std::string const &str,std::ostream &out)
+	{
+		to_json(str.c_str(),str.c_str()+str.size(),out);
 	}
 
 	namespace {
-
-		std::string escape(std::string const &input)
-		{
-			std::string result;
-			result.reserve(input.size());
-			result+='"';
-			std::string::const_iterator i,end=input.end();
-			for(i=input.begin();i!=end;i++) {
-				switch(*i) {
-				case 0x22:
-				case 0x5C:
-					result+='\\';
-					result+=*i;
-					break;
-				case '\b': result+="\\b"; break;
-				case '\f': result+="\\f"; break;
-				case '\n': result+="\\n"; break;
-				case '\r': result+="\\r"; break;
-				case '\t': result+="\\t"; break;
-				default:
-					if(0x00<=*i && *i<=0x1F) {
-						char buf[8];
-#ifdef CPPCMS_HAVE_SNPRINTF						
-						snprintf(buf,sizeof(buf),"\\u%04X",*i);
-#else
-						sprintf(buf,"\\u%04X",*i);
-#endif
-						result+=buf;
-					}
-					else {
-						result+=*i;
-					}
-				}
-			}
-			result+='"';
-			return result;
-		}
 
 		void pad(std::ostream &out,int tb)
 		{
@@ -318,7 +552,7 @@ namespace json {
 			out<<std::setprecision(std::numeric_limits<double>::digits10+1)<<number();
 			break;
 		case json::is_string:
-			out<<escape(str());
+			to_json(str(),out);
 			break;
 		case json::is_boolean:
 			out<< (boolean() ? "true" : "false") ;
@@ -345,7 +579,7 @@ namespace json {
 				end=obj.end();
 				indent(out,'{',tabs);
 				while(p!=end) {
-					out<<escape(p->first);
+					to_json(p->first.begin(),p->first.end(),out);
 					indent(out,':',tabs);
 					p->second.write_value(out,tabs);
 					++p;
